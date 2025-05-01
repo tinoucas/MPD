@@ -39,6 +39,8 @@ static constexpr Domain cdio_domain("cdio");
 static bool default_reverse_endian;
 static unsigned speed = 0;
 
+static const char* musicbrainzId = nullptr;
+
 /* Default to full paranoia, but allow skipping sectors. */
 static int mode_flags = PARANOIA_MODE_FULL^PARANOIA_MODE_NEVERSKIP;
 
@@ -232,7 +234,6 @@ makeMusicBrainzIdWith(int firstTrack, int lastTrack, int leadIn, std::vector<int
 static const char*
 createMusicBrainzId (cdrom_drive_t *const drv)
 {
-	auto firstSector = cdio_cddap_disc_firstsector(drv);
 	auto lastSector = cdio_cddap_disc_lastsector(drv);
 
 	int leadOut = (int)lastSector + 1;
@@ -242,20 +243,19 @@ createMusicBrainzId (cdrom_drive_t *const drv)
 	frameOffsets.push_back(leadOut);
 
 	auto numTracks = cdio_cddap_tracks(drv);
+	auto firstTrackNumber = cdio_get_first_track_num(drv->p_cdio);
 
 	for (int i = 0; i < numTracks; ++i)
 	{
-		auto frameOffset = cdio_cddap_track_firstsector(drv, i + 1);
+		auto frameOffset = cdio_cddap_track_firstsector(drv, i + firstTrackNumber);
 
 		frameOffsets.push_back((int)frameOffset);
 	}
 
-	int leadIn = 150; // FIXME
+	int leadIn = CDIO_PREGAP_SECTORS;
+	int lastTrack = numTracks + firstTrackNumber - 1;
 
-	int firstTrack = 1;
-	int lastTrack = numTracks;
-
-	return makeMusicBrainzIdWith(firstTrack, lastTrack, leadIn, frameOffsets);
+	return makeMusicBrainzIdWith(firstTrackNumber, lastTrack, leadIn, frameOffsets);
 }
 
 static InputStreamPtr
@@ -333,7 +333,7 @@ input_cdio_open(std::string_view uri,
 		lsn_to = cdio_cddap_disc_lastsector(drv);
 	}
 
-	const char* musicbrainzId = createMusicBrainzId(drv);
+	musicbrainzId = createMusicBrainzId(drv);
 	FmtDebug(cdio_domain, "MusicBrainzId: {}", musicbrainzId);
 
 	/* LSNs < 0 indicate errors (e.g. -401: Invaid track, -402: no pregap) */
