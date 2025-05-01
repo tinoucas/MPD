@@ -19,27 +19,121 @@
 #include "fs/AllocatedPath.hxx"
 #include "Log.hxx"
 #include "config/Block.hxx"
+#include "input/RemoteTagScanner.hxx"
 
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <vector>
+#include <map>
 
 #include <cdio/cd_types.h>
 
 extern "C" {
 #include <libavutil/sha.h>
 #include <libavutil/base64.h>
-}
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h> /* close() */
+#include <string.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#if defined(__linux__)
+#include <linux/cdrom.h>
+#define cdte_track_address      cdte_addr.lba
+#define DEVICE_NAME             "/dev/cdrom"
+
+#elif defined(__GNU__)
+/* According to Samuel Thibault <sthibault@debian.org>, cd-discid needs this
+ * to compile on Debian GNU/Hurd (i386) */
+#include <sys/cdrom.h>
+#define cdte_track_address      cdte_addr.lba
+#define DEVICE_NAME             "/dev/cd0"
+
+#elif defined(sun) && defined(unix) && defined(__SVR4)
+#include <sys/cdio.h>
+#define CD_MSF_OFFSET   150
+#define CD_FRAMES       75
+/* According to David Schweikert <dws@ee.ethz.ch>, cd-discid needs this
+ * to compile on Solaris */
+#define cdte_track_address      cdte_addr.lba
+#define DEVICE_NAME             "/dev/vol/aliases/cdrom0"
+
+/* __FreeBSD_kernel__ is needed for properly compiling on Debian GNU/kFreeBSD
+   Look at http://glibc-bsd.alioth.debian.org/porting/PORTING for more info */
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__DragonFly__)
+#include <sys/cdio.h>
+#define CDROM_LBA               CD_LBA_FORMAT    /* first frame is 0 */
+#define CD_MSF_OFFSET           150              /* MSF offset of first frame */
+#define CD_FRAMES               75               /* per second */
+#define CDROM_LEADOUT           0xAA             /* leadout track */
+#define CDROMREADTOCHDR         CDIOREADTOCHEADER
+#define CDROMREADTOCENTRY       CDIOREADTOCENTRY
+#define cdrom_tochdr            ioc_toc_header
+#define cdth_trk0               starting_track
+#define cdth_trk1               ending_track
+#define cdrom_tocentry          ioc_read_toc_single_entry
+#define cdte_track              track
+#define cdte_format             address_format
+#define cdte_track_address      entry.addr.lba
+#define DEVICE_NAME             "/dev/cdrom"
+
+#elif defined(__OpenBSD__) || defined(__NetBSD__)
+#include <sys/cdio.h>
+#define CDROM_LBA               CD_LBA_FORMAT    /* first frame is 0 */
+#define CD_MSF_OFFSET           150              /* MSF offset of first frame */
+#define CD_FRAMES               75               /* per second */
+#define CDROM_LEADOUT           0xAA             /* leadout track */
+#define CDROMREADTOCHDR         CDIOREADTOCHEADER
+#define cdrom_tochdr            ioc_toc_header
+#define cdth_trk0               starting_track
+#define cdth_trk1               ending_track
+#define cdrom_tocentry          cd_toc_entry
+#define cdte_track              track
+#define cdte_track_address      addr.lba
+#define DEVICE_NAME             "/dev/cd0a"
+
+#elif defined(__APPLE__)
+#include <sys/types.h>
+#include <IOKit/storage/IOCDTypes.h>
+#include <IOKit/storage/IOCDMediaBSDClient.h>
+#define CD_FRAMES               75               /* per second */
+#define CD_MSF_OFFSET           150              /* MSF offset of first frame */
+#define cdrom_tochdr            CDDiscInfo
+#define cdth_trk0               numberOfFirstTrack
+/* NOTE: Judging by the name here, we might have to do this:
+ * hdr.lastTrackNumberInLastSessionMSB << 8 *
+ * sizeof(hdr.lastTrackNumberInLastSessionLSB)
+ * | hdr.lastTrackNumberInLastSessionLSB; */
+#define cdth_trk1               lastTrackNumberInLastSessionLSB
+#define cdrom_tocentry          CDTrackInfo
+#define cdte_track_address      trackStartAddress
+#define DEVICE_NAME             "/dev/rdisk1"
+
+#elif defined(__sgi)
+#include <dmedia/cdaudio.h>
+#define CD_FRAMES               75               /* per second */
+#define CD_MSF_OFFSET           150              /* MSF offset of first frame */
+#define cdrom_tochdr            CDSTATUS
+#define cdth_trk0               first
+#define cdth_trk1               last
+#define close                   CDclose
+struct cdrom_tocentry
+{
+	int cdte_track_address;
+};
+#define DEVICE_NAME             "/dev/scsi/sc0d4l0"
+#else
+#error "Your OS isn't supported yet."
+#endif  /* os selection */
+}
 using std::string_view_literals::operator""sv;
 
 static constexpr Domain cdio_domain("cdio");
 
 static bool default_reverse_endian;
 static unsigned speed = 0;
-
-static const char* musicbrainzId = nullptr;
 
 /* Default to full paranoia, but allow skipping sectors. */
 static int mode_flags = PARANOIA_MODE_FULL^PARANOIA_MODE_NEVERSKIP;
@@ -95,42 +189,6 @@ class CdioParanoiaInputStream final : public InputStream {
 	void Seek(std::unique_lock<Mutex> &lock, offset_type offset) override;
 };
 
-static void
-input_cdio_init(EventLoop &, const ConfigBlock &block)
-{
-	const char *value = block.GetBlockValue("default_byte_order");
-	if (value != nullptr) {
-		if (strcmp(value, "little_endian") == 0)
-			default_reverse_endian = IsBigEndian();
-		else if (strcmp(value, "big_endian") == 0)
-			default_reverse_endian = IsLittleEndian();
-		else
-			throw FmtRuntimeError("Unrecognized 'default_byte_order' setting: {}",
-					      value);
-	}
-	speed = block.GetBlockValue("speed",0U);
-
-	if (const auto *param = block.GetBlockParam("mode")) {
-		param->With([](const char *s){
-			if (StringIsEqual(s, "disable"))
-				mode_flags = PARANOIA_MODE_DISABLE;
-			else if (StringIsEqual(s, "overlap"))
-				mode_flags = PARANOIA_MODE_OVERLAP;
-			else if (StringIsEqual(s, "full"))
-				mode_flags = PARANOIA_MODE_FULL;
-			else
-				throw std::invalid_argument{"Invalid paranoia mode"};
-		});
-	}
-
-	if (const auto *param = block.GetBlockParam("skip")) {
-		if (param->GetBoolValue())
-			mode_flags &= ~PARANOIA_MODE_NEVERSKIP;
-		else
-			mode_flags |= PARANOIA_MODE_NEVERSKIP;
-	}
-}
-
 struct CdioUri {
 	char device[64];
 	int track;
@@ -178,7 +236,7 @@ cdio_detect_device()
 	return AllocatedPath::FromFS(devices[0]);
 }
 
-static const char*
+static char*
 makeMusicBrainzIdWith(int firstTrack, int lastTrack, int leadIn, std::vector<int> frameOffsets)
 {
 	struct AVSHA* sha1 = av_sha_alloc();
@@ -231,31 +289,383 @@ makeMusicBrainzIdWith(int firstTrack, int lastTrack, int leadIn, std::vector<int
 	return output;
 }
 
-static const char*
-createMusicBrainzId (cdrom_drive_t *const drv)
+class CDDiscId
 {
-	auto lastSector = cdio_cddap_disc_lastsector(drv);
-
-	int leadOut = (int)lastSector + 1;
-
-	std::vector<int> frameOffsets;
-
-	frameOffsets.push_back(leadOut);
-
-	auto numTracks = cdio_cddap_tracks(drv);
-	auto firstTrackNumber = cdio_get_first_track_num(drv->p_cdio);
-
-	for (int i = 0; i < numTracks; ++i)
+public:
+	static char* getCurrentCDId (std::string_view uri)
 	{
-		auto frameOffset = cdio_cddap_track_firstsector(drv, i + firstTrackNumber);
+		const auto parsed_uri = parse_cdio_uri(uri);
 
-		frameOffsets.push_back((int)frameOffset);
+		const AllocatedPath device = parsed_uri.device[0] != 0
+			? AllocatedPath::FromFS(parsed_uri.device)
+			: cdio_detect_device();
+
+		if (device.IsNull())
+			return nullptr;
+
+		int len;
+		int i;
+		long int cksum = 0;
+		//int musicbrainz = 0;
+		unsigned char last = 1;
+		const char *devicename = device.c_str();
+		struct cdrom_tocentry *TocEntry;
+#ifndef __sgi
+		int drive;
+		struct cdrom_tochdr hdr;
+#else
+		CDPLAYER *drive;
+		CDTRACKINFO info;
+		cdrom_tochdr hdr;
+#endif
+		//char *command = argv[0];
+
+#if defined(__OpenBSD__) || defined(__NetBSD__)
+		struct ioc_read_toc_entry t;
+#elif defined(__APPLE__)
+		dk_cd_read_disc_info_t discInfoParams;
+#endif
+
+#if defined(__sgi)
+		drive = CDopen(devicename, "r");
+		if (drive == 0) {
+			return nullptr;
+		}
+#else
+		drive = open(devicename, O_RDONLY | O_NONBLOCK);
+		if (drive < 0) {
+			return nullptr;
+		}
+#endif
+
+#if defined(__APPLE__)
+		memset(&discInfoParams, 0, sizeof(discInfoParams));
+		discInfoParams.buffer = &hdr;
+		discInfoParams.bufferLength = sizeof(hdr);
+		if (ioctl(drive, DKIOCCDREADDISCINFO, &discInfoParams) < 0
+				|| discInfoParams.bufferLength != sizeof(hdr)) {
+			return nullptr;
+		}
+#elif defined(__sgi)
+		if (CDgetstatus(drive, &hdr) == 0) {
+			return nullptr
+		}
+#else
+		if (ioctl(drive, CDROMREADTOCHDR, &hdr) < 0) {
+			return nullptr;
+		}
+#endif
+
+		last = hdr.cdth_trk1;
+
+		len = (last + 1) * sizeof(struct cdrom_tocentry);
+
+		TocEntry = (cdrom_tocentry*)malloc(len);
+		if (!TocEntry) {
+			return nullptr;
+		}
+
+#if defined(__OpenBSD__)
+		t.starting_track = 0;
+#elif defined(__NetBSD__)
+		t.starting_track = 1;
+#endif
+
+#if defined(__OpenBSD__) || defined(__NetBSD__)
+		t.address_format = CDROM_LBA;
+		t.data_len = len;
+		t.data = TocEntry;
+		memset(TocEntry, 0, len);
+
+		if (ioctl(drive, CDIOREADTOCENTRYS, (char*)&t) < 0) {
+			return nullptr;
+		}
+#elif defined(__APPLE__)
+		dk_cd_read_track_info_t trackInfoParams;
+		memset(&trackInfoParams, 0, sizeof(trackInfoParams));
+		trackInfoParams.addressType = kCDTrackInfoAddressTypeTrackNumber;
+		trackInfoParams.bufferLength = sizeof(*TocEntry);
+
+		for (i = 0; i < last; i++) {
+			trackInfoParams.address = i + 1;
+			trackInfoParams.buffer = &TocEntry[i];
+
+			if (ioctl(drive, DKIOCCDREADTRACKINFO, &trackInfoParams) < 0) {
+				return nullptr;
+			}
+		}
+
+		/* MacOS X on G5-based systems does not report valid info for
+		 * TocEntry[last-1].lastRecordedAddress + 1, so we compute the start
+		 * of leadout from the start+length of the last track instead
+		 */
+		TocEntry[last].cdte_track_address = htonl(ntohl(TocEntry[last-1].trackSize) + ntohl(TocEntry[last-1].trackStartAddress));
+#elif defined(__sgi)
+		for (i = 0; i < last; i++) {
+			if (CDgettrackinfo(drive, i + 1, &info) == 0) {
+				return nullptr;
+			}
+			TocEntry[i].cdte_track_address = info.start_min*60*CD_FRAMES + info.start_sec*CD_FRAMES + info.start_frame;
+		}
+		TocEntry[last].cdte_track_address = TocEntry[last - 1].cdte_track_address + info.total_min*60*CD_FRAMES + info.total_sec*CD_FRAMES + info.total_frame;
+#else   /* FreeBSD, Linux, Solaris */
+		for (i = 0; i < last; i++) {
+			/* tracks start with 1, but I must start with 0 on OpenBSD */
+			TocEntry[i].cdte_track = i + 1;
+			TocEntry[i].cdte_format = CDROM_LBA;
+			if (ioctl(drive, CDROMREADTOCENTRY, &TocEntry[i]) < 0) {
+				return nullptr;
+			}
+		}
+
+		TocEntry[last].cdte_track = CDROM_LEADOUT;
+		TocEntry[last].cdte_format = CDROM_LBA;
+		if (ioctl(drive, CDROMREADTOCENTRY, &TocEntry[i]) < 0) {
+			return nullptr;
+		}
+#endif
+
+		/* release file handle */
+		close(drive);
+
+#if defined(__FreeBSD__) || defined(__DragonFly__) || defined(__APPLE__)
+		TocEntry[i].cdte_track_address = ntohl(TocEntry[i].cdte_track_address);
+#endif
+
+		for (i = 0; i < last; i++) {
+#if defined(__FreeBSD__) || defined(__DragonFly__) || defined(__APPLE__)
+			TocEntry[i].cdte_track_address = ntohl(TocEntry[i].cdte_track_address);
+#endif
+			cksum += cddb_sum((TocEntry[i].cdte_track_address + CD_MSF_OFFSET) / CD_FRAMES);
+		}
+
+		/*
+		 *totaltime = ((TocEntry[last].cdte_track_address + CD_MSF_OFFSET) / CD_FRAMES) -
+		 *    ((TocEntry[0].cdte_track_address + CD_MSF_OFFSET) / CD_FRAMES);
+		 */
+
+		/*
+		 *[> print discid <]
+		 *if (!musicbrainz)
+		 *    printf("%08lx ", (cksum % 0xff) << 24 | totaltime << 8 | last);
+		 */
+
+		/* print number of tracks */
+		//printf("%d", last);
+		int numTracks = last;
+		int firstTrackNumber = 1;
+
+		std::vector<int> frameOffsets;
+
+		if (last > 0)
+			frameOffsets.push_back(TocEntry[last].cdte_track_address);
+
+		/* print frame offsets of all tracks */
+		for (i = 0; i < last; i++)
+		{
+			//printf(" %d", TocEntry[i].cdte_track_address + CD_MSF_OFFSET);
+			frameOffsets.push_back(TocEntry[i].cdte_track_address);
+		}
+
+		free(TocEntry);
+
+		int leadIn = CDIO_PREGAP_SECTORS;
+		int lastTrack = numTracks + firstTrackNumber - 1;
+
+		auto musicId = makeMusicBrainzIdWith(firstTrackNumber, lastTrack, leadIn, frameOffsets);
+
+		FmtDebug(cdio_domain, "music id from cache: {}", musicId);
+		return musicId;
+	}
+private:
+	static int cddb_sum(int n)
+	{
+		/* a number like 2344 becomes 2+3+4+4 (13) */
+		int ret = 0;
+
+		while (n > 0) {
+			ret = ret + (n % 10);
+			n = n / 10;
+		}
+
+		return ret;
+	}
+};
+
+class CDTagsXmlCache
+{
+public:
+	struct TrackInfo
+	{
+		int trackNum = 0;
+		const char* title = nullptr;
+		const char* artist = nullptr;
+		const char* albumTitle = nullptr; 
+	};
+
+public:
+	class Listener
+	{
+	public: // CDTagsXmlCache::Listener
+		virtual void setTags (CDTagsXmlCache::TrackInfo& trackInfo) = 0;
+	};
+
+public:
+	~CDTagsXmlCache ()
+	{
+		deleteAndClearTracks();
 	}
 
-	int leadIn = CDIO_PREGAP_SECTORS;
-	int lastTrack = numTracks + firstTrackNumber - 1;
+	void request(std::string_view uri, Listener *listener)
+	{
+		if (insertedCdChanged(uri))
+		{
+			deleteAndClearTracks();
+			requestMusicBrainzTags();
+		}
+		FmtDebug(cdio_domain, "requesting uri: {}", uri);
+		listeners.insert(listener);
+	}
 
-	return makeMusicBrainzIdWith(firstTrackNumber, lastTrack, leadIn, frameOffsets);
+	bool insertedCdChanged (std::string_view uri)
+	{
+		char *cdId = CDDiscId::getCurrentCDId(uri);
+
+		if (cdId == nullptr)
+		{
+			FmtDebug(cdio_domain, "no cdid \\o/");
+			return true;
+		}
+
+		if (lastCdId == nullptr || strcmp(cdId, lastCdId) == 0)
+		{
+			delete [] cdId;
+			return false;
+		}
+		if (lastCdId != nullptr)
+			delete [] lastCdId;
+		lastCdId = cdId;
+		return true;
+	}
+
+	void deleteAndClearTracks ()
+	{
+		for (auto it : tracks)
+		{
+			auto& track = it.second;
+
+			if (track.title != nullptr)
+				delete [] track.title;
+			if (track.artist != nullptr)
+				delete [] track.artist;
+			if (track.albumTitle != nullptr)
+				delete [] track.albumTitle;
+		}
+	}
+
+	void requestMusicBrainzTags()
+	{
+		// generate url
+		// launch curl request
+	}
+
+	const char* lastCdId = nullptr;
+	std::map<int, TrackInfo> tracks;
+
+	static CDTagsXmlCache *instance;
+
+	static void deleteInstance ()
+	{
+		if (instance != nullptr)
+			delete instance;
+		instance = nullptr;
+	}
+
+	static CDTagsXmlCache* getInstance ()
+	{
+		if (instance == nullptr)
+			instance = new CDTagsXmlCache;
+		return instance;
+	}
+
+	std::set<Listener*> listeners;
+};
+
+CDTagsXmlCache* CDTagsXmlCache::instance = nullptr;
+
+class MusicBrainzTagScanner final
+: public RemoteTagScanner
+, public CDTagsXmlCache::Listener
+{
+	RemoteTagHandler &handler;
+	std::string_view uri;
+
+public:
+	MusicBrainzTagScanner(std::string_view _uri,
+			RemoteTagHandler &_handler)
+	: handler(_handler)
+	, uri(_uri)  
+	{
+	}
+
+	~MusicBrainzTagScanner() noexcept override
+	{
+	}
+
+public: // CDTagsXmlCache::Listener
+	virtual void setTags (CDTagsXmlCache::TrackInfo& trackInfo) override
+	{
+		if (trackInfo.title != nullptr)
+			FmtDebug(cdio_domain, "track title: {}", trackInfo.title);
+	}
+
+private:
+	void Start() noexcept override {
+		CDTagsXmlCache::getInstance()->request(uri, this);
+	}
+};
+
+static void
+input_cdio_init(EventLoop &, const ConfigBlock &block)
+{
+	const char *value = block.GetBlockValue("default_byte_order");
+	if (value != nullptr) {
+		if (strcmp(value, "little_endian") == 0)
+			default_reverse_endian = IsBigEndian();
+		else if (strcmp(value, "big_endian") == 0)
+			default_reverse_endian = IsLittleEndian();
+		else
+			throw FmtRuntimeError("Unrecognized 'default_byte_order' setting: {}",
+					      value);
+	}
+	speed = block.GetBlockValue("speed",0U);
+
+	if (const auto *param = block.GetBlockParam("mode")) {
+		param->With([](const char *s){
+			if (StringIsEqual(s, "disable"))
+				mode_flags = PARANOIA_MODE_DISABLE;
+			else if (StringIsEqual(s, "overlap"))
+				mode_flags = PARANOIA_MODE_OVERLAP;
+			else if (StringIsEqual(s, "full"))
+				mode_flags = PARANOIA_MODE_FULL;
+			else
+				throw std::invalid_argument{"Invalid paranoia mode"};
+		});
+	}
+
+	if (const auto *param = block.GetBlockParam("skip")) {
+		if (param->GetBoolValue())
+			mode_flags &= ~PARANOIA_MODE_NEVERSKIP;
+		else
+			mode_flags |= PARANOIA_MODE_NEVERSKIP;
+	}
+	CDTagsXmlCache::getInstance();
+}
+
+static void
+input_cdio_finish() noexcept
+{
+	CDTagsXmlCache::deleteInstance();
 }
 
 static InputStreamPtr
@@ -332,9 +742,6 @@ input_cdio_open(std::string_view uri,
 		lsn_from = cdio_cddap_disc_firstsector(drv);
 		lsn_to = cdio_cddap_disc_lastsector(drv);
 	}
-
-	musicbrainzId = createMusicBrainzId(drv);
-	FmtDebug(cdio_domain, "MusicBrainzId: {}", musicbrainzId);
 
 	/* LSNs < 0 indicate errors (e.g. -401: Invaid track, -402: no pregap) */
 	if(lsn_from < 0 || lsn_to < 0)
@@ -431,6 +838,12 @@ CdioParanoiaInputStream::IsEOF() const noexcept
 	return offset >= size;
 }
 
+static std::unique_ptr<RemoteTagScanner>
+musicbrainz_tags (std::string_view uri, RemoteTagHandler &handler)
+{
+	return std::make_unique<MusicBrainzTagScanner>(uri, handler);
+}
+
 static constexpr const char *cdio_paranoia_prefixes[] = {
 	"cdda://",
 	nullptr
@@ -440,7 +853,8 @@ const InputPlugin input_plugin_cdio_paranoia = {
 	"cdio_paranoia",
 	cdio_paranoia_prefixes,
 	input_cdio_init,
-	nullptr,
+	input_cdio_finish,
 	input_cdio_open,
-	nullptr
+	nullptr,
+	musicbrainz_tags,
 };
