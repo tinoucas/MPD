@@ -74,6 +74,7 @@ input_plugins = static_library(
     alsa_dep,
     curl_dep,
     ffmpeg_dep,
+    libavutil_dep,
     libcdio_paranoia_dep,
     libmms_dep,
     nfs_dep,

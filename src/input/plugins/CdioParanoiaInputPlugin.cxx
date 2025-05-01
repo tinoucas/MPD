@@ -23,8 +23,14 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <vector>
 
 #include <cdio/cd_types.h>
+
+extern "C" {
+#include <libavutil/sha.h>
+#include <libavutil/base64.h>
+}
 
 using std::string_view_literals::operator""sv;
 
@@ -170,6 +176,88 @@ cdio_detect_device()
 	return AllocatedPath::FromFS(devices[0]);
 }
 
+static const char*
+makeMusicBrainzIdWith(int firstTrack, int lastTrack, int leadIn, std::vector<int> frameOffsets)
+{
+	struct AVSHA* sha1 = av_sha_alloc();
+	const int numBitsSha1 = 160;
+	const int digestSize = numBitsSha1 / 8;
+	uint8_t digest[digestSize];
+	const int tempSize = 32;
+	char temp[tempSize];
+
+	av_sha_init(sha1, numBitsSha1);
+
+	snprintf(temp, tempSize, "%02X", firstTrack);
+	av_sha_update(sha1, (const uint8_t*)temp, strlen(temp));
+
+	snprintf(temp, tempSize, "%02X", lastTrack);
+	av_sha_update(sha1, (const uint8_t*)temp, strlen(temp));
+
+	for (size_t i = 0; i < 100; ++i)
+	{
+		int offset = 0;
+
+		if (i < frameOffsets.size())
+			offset = frameOffsets[i] + leadIn;
+		snprintf(temp, tempSize, "%08X", offset);
+		av_sha_update(sha1, (const uint8_t*)temp, strlen(temp));
+	}
+	av_sha_final(sha1, digest);
+	free(sha1);
+
+	const int outputSize = 128;
+	char *output = new char[outputSize];
+
+	av_base64_encode(output, outputSize, digest, digestSize);
+
+	for (size_t i = 0; i < strlen(output); ++i)
+	{
+		switch (output[i])
+		{
+		case '=':
+			output[i] = '-';
+			break;
+		case '/':
+			output[i] = '_';
+			break;
+		default:
+			break;
+		}
+	}
+
+	return output;
+}
+
+static const char*
+createMusicBrainzId (cdrom_drive_t *const drv)
+{
+	auto firstSector = cdio_cddap_disc_firstsector(drv);
+	auto lastSector = cdio_cddap_disc_lastsector(drv);
+
+	int leadOut = (int)lastSector + 1;
+
+	std::vector<int> frameOffsets;
+
+	frameOffsets.push_back(leadOut);
+
+	auto numTracks = cdio_cddap_tracks(drv);
+
+	for (int i = 0; i < numTracks; ++i)
+	{
+		auto frameOffset = cdio_cddap_track_firstsector(drv, i + 1);
+
+		frameOffsets.push_back((int)frameOffset);
+	}
+
+	int leadIn = 150; // FIXME
+
+	int firstTrack = 1;
+	int lastTrack = numTracks;
+
+	return makeMusicBrainzIdWith(firstTrack, lastTrack, leadIn, frameOffsets);
+}
+
 static InputStreamPtr
 input_cdio_open(std::string_view uri,
 		Mutex &mutex)
@@ -244,6 +332,9 @@ input_cdio_open(std::string_view uri,
 		lsn_from = cdio_cddap_disc_firstsector(drv);
 		lsn_to = cdio_cddap_disc_lastsector(drv);
 	}
+
+	const char* musicbrainzId = createMusicBrainzId(drv);
+	FmtDebug(cdio_domain, "MusicBrainzId: {}", musicbrainzId);
 
 	/* LSNs < 0 indicate errors (e.g. -401: Invaid track, -402: no pregap) */
 	if(lsn_from < 0 || lsn_to < 0)
