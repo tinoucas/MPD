@@ -25,6 +25,7 @@
 #include "config/Block.hxx"
 #include "input/RemoteTagScanner.hxx"
 #include "event/Loop.hxx"
+#include <upnp.h> // for IXML_Document
 
 #include <algorithm>
 #include <cassert>
@@ -517,10 +518,15 @@ public:
 public:
 	struct TrackInfo
 	{
-		int trackNum = 0;
-		const char* title = nullptr;
-		const char* artist = nullptr;
-		const char* albumTitle = nullptr; 
+		int trackNum = -99;
+		std::string title;
+		std::string artist;
+		std::string albumTitle;
+
+		std::string toString () const
+		{
+			return title + ", " + artist + ", " + albumTitle;
+		}
 	};
 
 public:
@@ -537,11 +543,10 @@ public: // CurlResponseHandler
 		auto resp = StringCurlResponseHandler::GetResponse();
 		std::string body = resp.body;
 
-		FmtDebug(cdio_domain, "received: {}", body);
+		makeTrackInfoFromXml(body);
+		dataReady = true;
 
 		/*
-		 *makeTrackInfoFromXml(body);
-		 *dataReady = true;
 		 *callListeners();
 		 */
 	}
@@ -622,18 +627,9 @@ public:
 	{
 		if (request != nullptr)
 			request->StopIndirect();
-
-		for (auto it : tracks)
-		{
-			auto& track = it.second;
-
-			if (track.title != nullptr)
-				delete [] track.title;
-			if (track.artist != nullptr)
-				delete [] track.artist;
-			if (track.albumTitle != nullptr)
-				delete [] track.albumTitle;
-		}
+		for (auto track : tracks)
+			delete track.second;
+		tracks.clear();
 	}
 
 	void requestMusicBrainzTags()
@@ -653,11 +649,129 @@ public:
 		request->StartIndirect();
 	}
 
-	const char* lastCdId = nullptr;
-	std::map<int, TrackInfo> tracks;
+	void makeTrackInfoFromXml (std::string body)
+	{
+		IXML_Document *document = ixmlParseBuffer(body.c_str());
+		std::string albumTitle;
 
-	static CDTagsXmlCache *instance;
+		if (document != nullptr)
+		{
+			IXML_NodeList *releaseNode = ixmlDocument_getElementsByTagName(document, "release");
 
+			if (releaseNode != nullptr && releaseNode->nodeItem != nullptr)
+			{
+				auto releaseInfoNode = ixmlNode_getChildNodes(releaseNode->nodeItem);
+
+				while (releaseInfoNode != nullptr && releaseInfoNode->nodeItem != nullptr)
+				{
+					auto nodeName = ixmlNode_getNodeName(releaseInfoNode->nodeItem);
+
+					if (strcmp(nodeName, "title") == 0)
+					{
+						auto value = ixmlNode_getNodeValue(ixmlNode_getFirstChild(releaseInfoNode->nodeItem));
+
+						if (value == nullptr)
+						{
+							FmtDebug(cdio_domain, "no value");
+							return ;
+						}
+						albumTitle = value;
+						FmtDebug(cdio_domain, "album: {}", albumTitle);
+						break;
+					}
+					releaseInfoNode = releaseInfoNode->next;
+				}
+			}
+
+			IXML_NodeList *trackListNode = ixmlDocument_getElementsByTagName(document, "track-list");
+			
+			if (trackListNode != nullptr && trackListNode->nodeItem != nullptr)
+			{
+				FmtDebug(cdio_domain, "track-list node found");
+
+				IXML_NodeList *tracksNode = ixmlNode_getChildNodes(trackListNode->nodeItem);
+
+				while (tracksNode != nullptr && tracksNode->nodeItem != nullptr)
+				{
+					TrackInfo *trackInfo = new TrackInfo;
+					IXML_NodeList *trackNode = ixmlNode_getChildNodes(tracksNode->nodeItem);
+
+					while (trackNode != nullptr && trackNode->nodeItem != nullptr)
+					{
+						auto nodeName = ixmlNode_getNodeName(trackNode->nodeItem);
+
+						if (strcmp(nodeName, "recording") == 0)
+						{
+							auto recordNode = ixmlNode_getChildNodes(trackNode->nodeItem);
+
+							while (recordNode != nullptr && recordNode->nodeItem != nullptr)
+							{
+								auto childName = ixmlNode_getNodeName(recordNode->nodeItem);
+
+								if (strcmp(childName, "title") == 0)
+								{
+									auto title = ixmlNode_getNodeValue(ixmlNode_getFirstChild(recordNode->nodeItem));
+									trackInfo->title = std::string(title);
+								}
+								else if (strcmp(childName, "artist-credit") == 0)
+								{
+									auto nameCredit = ixmlNode_getChildNodes(recordNode->nodeItem);
+
+									if (nameCredit != nullptr && nameCredit->nodeItem != nullptr)
+									{
+										auto artistNode = ixmlNode_getChildNodes(nameCredit->nodeItem);
+
+										if (artistNode != nullptr && artistNode->nodeItem != nullptr)
+										{
+											auto artistInfoNode = ixmlNode_getChildNodes(artistNode->nodeItem);
+
+											while (artistInfoNode != nullptr && artistInfoNode->nodeItem != nullptr)
+											{
+												auto artistInfoName = ixmlNode_getNodeName(artistInfoNode->nodeItem);
+
+												if (strcmp(artistInfoName, "name") == 0)
+												{
+													auto artist = ixmlNode_getNodeValue(ixmlNode_getFirstChild(artistInfoNode->nodeItem));
+													trackInfo->artist = std::string(artist);
+												}
+												artistInfoNode = artistInfoNode->next;
+											}
+										}
+
+									}
+								}
+
+								recordNode = recordNode->next;
+							}
+						}
+						else if (strcmp(nodeName, "number") == 0)
+						{
+							auto value = ixmlNode_getNodeValue(ixmlNode_getFirstChild(trackNode->nodeItem));
+
+							trackInfo->trackNum = atoi(value);
+						}
+						trackNode = trackNode->next;
+					}
+					if (trackInfo->trackNum != -99)
+					{
+						trackInfo->albumTitle = albumTitle;
+						FmtDebug(cdio_domain, "trackInfo {}, {}", trackInfo->trackNum, trackInfo->toString());
+						tracks[trackInfo->trackNum] = trackInfo;
+					}
+					else
+					{
+						delete trackInfo;
+					}
+					
+					tracksNode = tracksNode->next;
+				}
+			}
+
+			ixmlDocument_free(document);
+		}
+	}
+
+public:
 	static void deleteInstance ()
 	{
 		if (instance != nullptr)
@@ -674,6 +788,12 @@ public:
 	{
 		return instance;
 	}
+
+private:
+	const char* lastCdId = nullptr;
+	std::map<int, TrackInfo*> tracks;
+
+	static CDTagsXmlCache *instance;
 
 	std::map<int, std::set<Listener*> > listeners;
 	Mutex mutex;
@@ -707,8 +827,7 @@ public:
 public: // CDTagsXmlCache::Listener
 	virtual void setTags (CDTagsXmlCache::TrackInfo& trackInfo) override
 	{
-		if (trackInfo.title != nullptr)
-			FmtDebug(cdio_domain, "track title: {}", trackInfo.title);
+		FmtDebug(cdio_domain, "track title: {}", trackInfo.title);
 	}
 
 private:
