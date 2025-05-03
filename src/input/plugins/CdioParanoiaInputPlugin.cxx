@@ -888,7 +888,7 @@ public: // CDTagsXmlCache::Listener
 		b.AddItem(TAG_ARTIST, trackInfo.artist);
 		b.AddItem(TAG_ALBUM, trackInfo.albumTitle);
 		b.AddItem(TAG_ALBUM_ARTIST, trackInfo.albumArtist);
-		b.AddItem(TAG_TRACK, fmt::format_int{trackInfo.trackNum}.c_str());
+		b.AddItem(TAG_TRACK, std::to_string(trackInfo.trackNum));
 		b.Commit(tag);
 
 		handler.OnRemoteTag(std::move(tag));
