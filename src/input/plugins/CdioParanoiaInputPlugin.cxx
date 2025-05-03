@@ -25,6 +25,8 @@
 #include "config/Block.hxx"
 #include "input/RemoteTagScanner.hxx"
 #include "event/Loop.hxx"
+#include "tag/Builder.hxx"
+#include "tag/Tag.hxx"
 #include <upnp.h> // for IXML_Document
 
 #include <algorithm>
@@ -544,11 +546,8 @@ public: // CurlResponseHandler
 		std::string body = resp.body;
 
 		makeTrackInfoFromXml(body);
-		dataReady = true;
 
-		/*
-		 *callListeners();
-		 */
+		callListeners();
 	}
 
 	void OnError(std::exception_ptr ) noexcept override
@@ -558,34 +557,34 @@ public: // CurlResponseHandler
 public:
 	void requestTags (std::string_view& uri, Listener *listener)
 	{
-		const std::scoped_lock lock{mutex};
+		bool callListener = false;
+		int trackNum;
 
-		if (insertedCdChanged(uri))
 		{
-			deleteAndClearTracks();
-			requestMusicBrainzTags();
+			const std::scoped_lock lock{mutex};
+			const char* uriPrefix = "cdda:///";
+
+			if (strlen(uri.data()) <= strlen(uriPrefix))
+				return ;
+
+			trackNum = atoi(uri.data() + strlen(uriPrefix));
+
+			if (insertedCdChanged(uri))
+			{
+				deleteAndClearTracks();
+				requestMusicBrainzTags();
+			}
+			callListener = dataReady;
+			if (!dataReady)
+				listeners[trackNum].insert(listener);
 		}
-		FmtDebug(cdio_domain, "requesting uri: {}", uri);
-		const char* uriPrefix = "cdda:///";
 
-		if (strlen(uri.data()) > strlen(uriPrefix))
+		if (callListener)
 		{
-			int trackNum = atoi(uri.data() + strlen(uriPrefix));
-			listeners[trackNum].insert(listener);
-		}
-	}
+			auto it = tracks.find(trackNum);
 
-	void fillTrackInfo (int trackNum, TrackInfo& info)
-	{
-		const std::scoped_lock lock{mutex};
-
-		auto it = listeners.find(trackNum);
-
-		if (it != listeners.end())
-		{
-			for (auto listener : it->second)
-				listener->setTags(info);
-			listeners.erase(it);
+			if (it != tracks.end())
+				listener->setTags(*it->second);
 		}
 	}
 
@@ -627,6 +626,7 @@ public:
 	{
 		if (request != nullptr)
 			request->StopIndirect();
+
 		for (auto track : tracks)
 			delete track.second;
 		tracks.clear();
@@ -771,6 +771,29 @@ public:
 		}
 	}
 
+	void callListeners ()
+	{
+		const std::scoped_lock lock{mutex};
+
+		dataReady = true;
+		for (auto it : listeners)
+		{
+			int trackNum = it.first;
+			auto trackInfoIt = tracks.find(trackNum);
+
+			if (trackInfoIt == tracks.end())
+			{
+				// error
+				continue;
+			}
+
+			for (auto listener : it.second)
+			{
+				listener->setTags(*trackInfoIt->second);
+			}
+		}
+	}
+
 public:
 	static void deleteInstance ()
 	{
@@ -828,6 +851,17 @@ public: // CDTagsXmlCache::Listener
 	virtual void setTags (CDTagsXmlCache::TrackInfo& trackInfo) override
 	{
 		FmtDebug(cdio_domain, "track title: {}", trackInfo.title);
+
+		TagBuilder b;
+		Tag tag;
+
+		b.AddItem(TAG_TITLE, trackInfo.title);
+		b.AddItem(TAG_ALBUM, trackInfo.albumTitle);
+		b.AddItem(TAG_ARTIST, trackInfo.artist);
+		b.AddItem(TAG_TRACK, fmt::format_int{trackInfo.trackNum}.c_str());
+		b.Commit(tag);
+
+		handler.OnRemoteTag(std::move(tag));
 	}
 
 private:
