@@ -8,6 +8,10 @@
 #include "CdioParanoiaInputPlugin.hxx"
 #include "lib/cdio/Paranoia.hxx"
 #include "lib/fmt/RuntimeError.hxx"
+#include "lib/curl/Init.hxx"
+#include "lib/curl/Headers.hxx"
+#include "lib/curl/Request.hxx"
+#include "lib/curl/StringHandler.hxx"
 #include "../InputStream.hxx"
 #include "../InputPlugin.hxx"
 #include "util/StringCompare.hxx"
@@ -20,6 +24,7 @@
 #include "Log.hxx"
 #include "config/Block.hxx"
 #include "input/RemoteTagScanner.hxx"
+#include "event/Loop.hxx"
 
 #include <algorithm>
 #include <cassert>
@@ -281,6 +286,9 @@ makeMusicBrainzIdWith(int firstTrack, int lastTrack, int leadIn, std::vector<int
 		case '/':
 			output[i] = '_';
 			break;
+		case '+':
+			output[i] = '.';
+			break;
 		default:
 			break;
 		}
@@ -493,7 +501,19 @@ private:
 };
 
 class CDTagsXmlCache
+: public StringCurlResponseHandler
 {
+public:
+	CDTagsXmlCache (EventLoop &event_loop)
+	: curl(event_loop)
+	{
+	}
+
+	virtual ~CDTagsXmlCache ()
+	{
+		deleteAndClearTracks();
+	}
+
 public:
 	struct TrackInfo
 	{
@@ -510,21 +530,71 @@ public:
 		virtual void setTags (CDTagsXmlCache::TrackInfo& trackInfo) = 0;
 	};
 
-public:
-	~CDTagsXmlCache ()
+public: // CurlResponseHandler
+	/* virtual methods from CurlResponseHandler */
+	void OnEnd() override
 	{
-		deleteAndClearTracks();
+		auto resp = StringCurlResponseHandler::GetResponse();
+		std::string body = resp.body;
+
+		FmtDebug(cdio_domain, "received: {}", body);
+
+		/*
+		 *makeTrackInfoFromXml(body);
+		 *dataReady = true;
+		 *callListeners();
+		 */
 	}
 
-	void request(std::string_view uri, Listener *listener)
+	void OnError(std::exception_ptr ) noexcept override
 	{
+	}
+
+public:
+	void requestTags (std::string_view& uri, Listener *listener)
+	{
+		const std::scoped_lock lock{mutex};
+
 		if (insertedCdChanged(uri))
 		{
 			deleteAndClearTracks();
 			requestMusicBrainzTags();
 		}
 		FmtDebug(cdio_domain, "requesting uri: {}", uri);
-		listeners.insert(listener);
+		const char* uriPrefix = "cdda:///";
+
+		if (strlen(uri.data()) > strlen(uriPrefix))
+		{
+			int trackNum = atoi(uri.data() + strlen(uriPrefix));
+			listeners[trackNum].insert(listener);
+		}
+	}
+
+	void fillTrackInfo (int trackNum, TrackInfo& info)
+	{
+		const std::scoped_lock lock{mutex};
+
+		auto it = listeners.find(trackNum);
+
+		if (it != listeners.end())
+		{
+			for (auto listener : it->second)
+				listener->setTags(info);
+			listeners.erase(it);
+		}
+	}
+
+	void cancelRequest (Listener* listener)
+	{
+		const std::scoped_lock lock{mutex};
+
+		for (auto it : listeners)
+		{
+			auto lit = it.second.find(listener);
+
+			if (lit != it.second.end())
+				it.second.erase(lit);
+		}
 	}
 
 	bool insertedCdChanged (std::string_view uri)
@@ -537,7 +607,7 @@ public:
 			return true;
 		}
 
-		if (lastCdId == nullptr || strcmp(cdId, lastCdId) == 0)
+		if (lastCdId != nullptr && strcmp(cdId, lastCdId) == 0)
 		{
 			delete [] cdId;
 			return false;
@@ -550,6 +620,9 @@ public:
 
 	void deleteAndClearTracks ()
 	{
+		if (request != nullptr)
+			request->StopIndirect();
+
 		for (auto it : tracks)
 		{
 			auto& track = it.second;
@@ -565,8 +638,19 @@ public:
 
 	void requestMusicBrainzTags()
 	{
+		if (lastCdId == nullptr || strlen(lastCdId) == 0)
+			return ;
+
 		// generate url
+		std::string urlPrefix("https://musicbrainz.org/ws/2/discid/");
+		std::string urlArgs("?inc=artist-credits+recordings");
+		std::string url = urlPrefix + std::string(lastCdId) + urlArgs;
+
 		// launch curl request
+		if (request != nullptr)
+			delete request;
+		request = new CurlRequest(*curl, url.c_str(), *(StringCurlResponseHandler*)this);
+		request->StartIndirect();
 	}
 
 	const char* lastCdId = nullptr;
@@ -581,14 +665,22 @@ public:
 		instance = nullptr;
 	}
 
+	static void createInstance (EventLoop &event_loop)
+	{
+		instance = new CDTagsXmlCache(event_loop);
+	}
+
 	static CDTagsXmlCache* getInstance ()
 	{
-		if (instance == nullptr)
-			instance = new CDTagsXmlCache;
 		return instance;
 	}
 
-	std::set<Listener*> listeners;
+	std::map<int, std::set<Listener*> > listeners;
+	Mutex mutex;
+	CurlInit curl;
+	CurlRequest* request = nullptr;
+	bool curlRequested = false;
+	bool dataReady = false;
 };
 
 CDTagsXmlCache* CDTagsXmlCache::instance = nullptr;
@@ -621,12 +713,12 @@ public: // CDTagsXmlCache::Listener
 
 private:
 	void Start() noexcept override {
-		CDTagsXmlCache::getInstance()->request(uri, this);
+		CDTagsXmlCache::getInstance()->requestTags(uri, this);
 	}
 };
 
 static void
-input_cdio_init(EventLoop &, const ConfigBlock &block)
+input_cdio_init(EventLoop &event_loop, const ConfigBlock &block)
 {
 	const char *value = block.GetBlockValue("default_byte_order");
 	if (value != nullptr) {
@@ -659,7 +751,7 @@ input_cdio_init(EventLoop &, const ConfigBlock &block)
 		else
 			mode_flags |= PARANOIA_MODE_NEVERSKIP;
 	}
-	CDTagsXmlCache::getInstance();
+	CDTagsXmlCache::createInstance(event_loop);
 }
 
 static void
