@@ -72,6 +72,7 @@ input_plugins = static_library(
     input_basic_dep,
     log_dep,
     alsa_dep,
+    upnp_dep,
     curl_dep,
     ffmpeg_dep,
     libavutil_dep,
