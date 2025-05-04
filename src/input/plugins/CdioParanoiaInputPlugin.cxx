@@ -527,6 +527,7 @@ public:
 		std::string albumTitle;
 		std::string albumDate;
 		std::string albumArtist;
+		std::string albumGenre;
 		int duration = 0;
 
 		std::string toString () const
@@ -643,7 +644,7 @@ public:
 
 		// generate url
 		std::string urlPrefix("https://musicbrainz.org/ws/2/discid/");
-		std::string urlArgs("?inc=artist-credits+recordings");
+		std::string urlArgs("?inc=artist-credits+recordings+genres");
 		std::string url = urlPrefix + std::string(lastCdId) + urlArgs;
 
 		// launch curl request
@@ -659,6 +660,7 @@ public:
 		std::string albumTitle;
 		std::string albumDate;
 		std::string albumArtist;
+		std::string albumGenre;
 		bool validDocument = (document != nullptr);
 
 		if (document != nullptr)
@@ -715,6 +717,27 @@ public:
 									{
 										auto artist = ixmlNode_getNodeValue(ixmlNode_getFirstChild(artistInfoNode->nodeItem));
 										albumArtist = std::string(artist);
+									}
+									else if (strcmp(artistInfoName, "genre-list") == 0)
+									{
+										auto genreListNode = ixmlNode_getChildNodes(artistInfoNode->nodeItem);
+
+										while (genreListNode != nullptr && genreListNode->nodeItem != nullptr)
+										{
+											auto genre = ixmlNode_getFirstChild(genreListNode->nodeItem);
+											auto genreNodeName = ixmlNode_getNodeName(artistInfoNode->nodeItem);
+											if (strcmp(genreNodeName, "genre") == 0)
+											{
+												auto genreNameNode = ixmlNode_getFirstChild(genre);
+												auto genreName = ixmlNode_getNodeValue(ixmlNode_getFirstChild(genreNameNode));
+
+												if (albumGenre == std::string())
+													albumGenre = std::string(genreName);
+												else
+													albumGenre = albumGenre + std::string(",") + std::string(genreName);
+											}
+											genreListNode = genreListNode->next;
+										}
 									}
 									artistInfoNode = artistInfoNode->next;
 								}
@@ -818,6 +841,7 @@ public:
 						trackInfo->albumTitle = albumTitle;
 						trackInfo->albumDate = albumDate;
 						trackInfo->albumArtist = albumArtist;
+						trackInfo->albumGenre = albumGenre;
 						// FmtDebug(cdio_domain, "trackInfo {}, {}", trackInfo->trackNum, trackInfo->toString());
 						tracks[trackInfo->trackNum] = trackInfo;
 					}
@@ -924,6 +948,7 @@ public: // CDTagsXmlCache::Listener
 		b.AddItem(TAG_ALBUM, trackInfo.albumTitle);
 		b.AddItem(TAG_DATE, trackInfo.albumDate);
 		b.AddItem(TAG_ALBUM_ARTIST, trackInfo.albumArtist);
+		b.AddItem(TAG_GENRE, trackInfo.albumGenre);
 		b.AddItem(TAG_TRACK, std::to_string(trackInfo.trackNum));
 		b.SetDuration(SignedSongTime::FromS(trackInfo.duration));
 		b.Commit(tag);
