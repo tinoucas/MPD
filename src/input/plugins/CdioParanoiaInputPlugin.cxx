@@ -725,7 +725,8 @@ public:
 										while (genreListNode != nullptr && genreListNode->nodeItem != nullptr)
 										{
 											auto genre = ixmlNode_getFirstChild(genreListNode->nodeItem);
-											auto genreNodeName = ixmlNode_getNodeName(artistInfoNode->nodeItem);
+											auto genreNodeName = ixmlNode_getNodeName(genre);
+
 											if (strcmp(genreNodeName, "genre") == 0)
 											{
 												auto genreNameNode = ixmlNode_getFirstChild(genre);
