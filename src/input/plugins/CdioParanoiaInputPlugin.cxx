@@ -523,7 +523,9 @@ public:
 		int trackNum = -99;
 		std::string title;
 		std::string artist;
+		std::string firstReleaseDate;
 		std::string albumTitle;
+		std::string albumDate;
 		std::string albumArtist;
 		int duration = 0;
 
@@ -655,6 +657,7 @@ public:
 	{
 		IXML_Document *document = ixmlParseBuffer(body.c_str());
 		std::string albumTitle;
+		std::string albumDate;
 		std::string albumArtist;
 		bool validDocument = (document != nullptr);
 
@@ -679,7 +682,18 @@ public:
 							FmtDebug(cdio_domain, "no value");
 							return false;
 						}
-						albumTitle = value;
+						albumTitle = std::string(value);
+					}
+					else if (strcmp(nodeName, "date") == 0)
+					{
+						auto value = ixmlNode_getNodeValue(ixmlNode_getFirstChild(releaseInfoNode->nodeItem));
+
+						if (value == nullptr)
+						{
+							FmtDebug(cdio_domain, "no value");
+							return false;
+						}
+						albumDate = std::string(value);
 					}
 					else if (strcmp(nodeName, "artist-credit") == 0)
 					{
@@ -751,6 +765,15 @@ public:
 										trackInfo->duration = atoi(value) / 1000;
 									}
 								}
+								else if (strcmp(childName, "first-release-date") == 0)
+								{
+									auto value = ixmlNode_getNodeValue(ixmlNode_getFirstChild(recordNode->nodeItem));
+
+									if (value != nullptr && strlen(value) > 0)
+									{
+										trackInfo->firstReleaseDate = std::string(value);
+									}
+								}
 								else if (strcmp(childName, "artist-credit") == 0)
 								{
 									auto nameCredit = ixmlNode_getChildNodes(recordNode->nodeItem);
@@ -793,6 +816,7 @@ public:
 					if (trackInfo->trackNum != -99)
 					{
 						trackInfo->albumTitle = albumTitle;
+						trackInfo->albumDate = albumDate;
 						trackInfo->albumArtist = albumArtist;
 						// FmtDebug(cdio_domain, "trackInfo {}, {}", trackInfo->trackNum, trackInfo->toString());
 						tracks[trackInfo->trackNum] = trackInfo;
@@ -896,7 +920,9 @@ public: // CDTagsXmlCache::Listener
 
 		b.AddItem(TAG_TITLE, trackInfo.title);
 		b.AddItem(TAG_ARTIST, trackInfo.artist);
+		b.AddItem(TAG_ORIGINAL_DATE, trackInfo.firstReleaseDate);
 		b.AddItem(TAG_ALBUM, trackInfo.albumTitle);
+		b.AddItem(TAG_DATE, trackInfo.albumDate);
 		b.AddItem(TAG_ALBUM_ARTIST, trackInfo.albumArtist);
 		b.AddItem(TAG_TRACK, std::to_string(trackInfo.trackNum));
 		b.SetDuration(SignedSongTime::FromS(trackInfo.duration));
