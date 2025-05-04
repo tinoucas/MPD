@@ -785,7 +785,7 @@ public:
 
 									if (value != nullptr && strlen(value) > 0)
 									{
-										trackInfo->duration = atoi(value) / 1000;
+										trackInfo->duration = (atoi(value) + 500) / 1000;
 									}
 								}
 								else if (strcmp(childName, "first-release-date") == 0)
