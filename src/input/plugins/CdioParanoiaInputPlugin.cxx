@@ -724,13 +724,12 @@ public:
 
 										while (genreListNode != nullptr && genreListNode->nodeItem != nullptr)
 										{
-											auto genre = ixmlNode_getFirstChild(genreListNode->nodeItem);
-											auto genreNodeName = ixmlNode_getNodeName(genre);
+											auto genre = ixmlNode_getChildNodes(genreListNode->nodeItem);
+											auto genreNodeName = ixmlNode_getNodeName(genre->nodeItem);
 
-											if (strcmp(genreNodeName, "genre") == 0)
+											if (strcmp(genreNodeName, "name") == 0)
 											{
-												auto genreNameNode = ixmlNode_getFirstChild(genre);
-												auto genreName = ixmlNode_getNodeValue(ixmlNode_getFirstChild(genreNameNode));
+												auto genreName = ixmlNode_getNodeValue(ixmlNode_getFirstChild(genre->nodeItem));
 
 												if (albumGenre == std::string())
 													albumGenre = std::string(genreName);
