@@ -525,6 +525,7 @@ public:
 		std::string artist;
 		std::string albumTitle;
 		std::string albumArtist;
+		int duration = 0;
 
 		std::string toString () const
 		{
@@ -741,6 +742,15 @@ public:
 									auto title = ixmlNode_getNodeValue(ixmlNode_getFirstChild(recordNode->nodeItem));
 									trackInfo->title = std::string(title);
 								}
+								else if (strcmp(childName, "length") == 0)
+								{
+									auto value = ixmlNode_getNodeValue(ixmlNode_getFirstChild(recordNode->nodeItem));
+
+									if (value != nullptr && strlen(value) > 0)
+									{
+										trackInfo->duration = atoi(value) / 1000;
+									}
+								}
 								else if (strcmp(childName, "artist-credit") == 0)
 								{
 									auto nameCredit = ixmlNode_getChildNodes(recordNode->nodeItem);
@@ -889,6 +899,7 @@ public: // CDTagsXmlCache::Listener
 		b.AddItem(TAG_ALBUM, trackInfo.albumTitle);
 		b.AddItem(TAG_ALBUM_ARTIST, trackInfo.albumArtist);
 		b.AddItem(TAG_TRACK, std::to_string(trackInfo.trackNum));
+		b.SetDuration(SignedSongTime::FromS(trackInfo.duration));
 		b.Commit(tag);
 
 		handler.OnRemoteTag(std::move(tag));
