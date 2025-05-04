@@ -946,7 +946,10 @@ public: // CDTagsXmlCache::Listener
 		b.AddItem(TAG_ARTIST, trackInfo.artist);
 		b.AddItem(TAG_ORIGINAL_DATE, trackInfo.firstReleaseDate);
 		b.AddItem(TAG_ALBUM, trackInfo.albumTitle);
-		b.AddItem(TAG_DATE, trackInfo.albumDate);
+		if (trackInfo.albumDate == std::string())
+			b.AddItem(TAG_DATE, trackInfo.firstReleaseDate);
+		else
+			b.AddItem(TAG_DATE, trackInfo.albumDate);
 		b.AddItem(TAG_ALBUM_ARTIST, trackInfo.albumArtist);
 		b.AddItem(TAG_GENRE, trackInfo.albumGenre);
 		b.AddItem(TAG_TRACK, std::to_string(trackInfo.trackNum));
