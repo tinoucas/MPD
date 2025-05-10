@@ -41,11 +41,6 @@ class RemoteTagScanner {
 public:
 	virtual ~RemoteTagScanner() noexcept = default;
 	virtual void Start() = 0;
-
-	virtual bool DisableTagCaching ()
-	{
-		return false;
-	}
 };
 
 #endif

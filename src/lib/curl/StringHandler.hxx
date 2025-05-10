@@ -34,11 +34,6 @@ public:
 		return std::move(response);
 	}
 
-	void ResetResponse ()
-	{
-		response = {};
-	}
-
 public:
 	/* virtual methods from class CurlResponseHandler */
 	void OnHeaders(unsigned status, Curl::Headers &&headers) override;
